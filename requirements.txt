@@ -1,0 +1,4 @@
+pandas==2.1.1
+flask>=2.3.2
+requests
+ccxt
