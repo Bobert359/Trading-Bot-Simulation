@@ -3,10 +3,9 @@ import os
 import pandas as pd
 import time
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, jsonify, render_template_string
-import random  # für kleine Preisschwankungen im Simulationstest
 
 # === TELEGRAM KONFIGURATION ===
 telegram_token = '7793055320:AAFhsfKiAsK766lBL4olwGamBA8q6HCFtqk'
@@ -25,10 +24,10 @@ order_size_usdt = 10
 trigger_pct = 1.5
 profit_target = 10.0
 stop_loss = 3.0
+fee_pct = 0.0004  # 0.04% pro Trade
 
 # === SIMULATION ===
-symbol = 'BTC/USDT'
-price_sim = 100.0  # Startpreis für Simulation
+symbol = 'BTCUSDT'
 open_trades = []
 last_status_update = datetime.now(timezone.utc)
 
@@ -37,7 +36,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return '✅ Trading Bot Simulation läuft!'
+    return '✅ Trading Bot Echtzeit-Simulation läuft!'
 
 @app.route('/ping')
 def ping():
@@ -87,7 +86,7 @@ def dashboard():
     html = f"""
     <html>
     <head>
-        <title>Trading Bot Simulation Dashboard</title>
+        <title>Trading Bot Dashboard</title>
         <meta http-equiv="refresh" content="10">
         <style>
             body {{ font-family: Arial; background: #f4f4f4; }}
@@ -98,7 +97,7 @@ def dashboard():
         </style>
     </head>
     <body>
-        <h1>📊 Trading Bot Simulation Dashboard</h1>
+        <h1>📊 Trading Bot Dashboard</h1>
         <p>Aktueller Preis: <strong>{current_price:.2f} USDT</strong></p>
         <p>Offene Trades: {len(open_trades)} (Long: {long_trades} / Short: {short_trades})</p>
         <p>📈 Unrealized PnL: <strong>{unrealized_pnl:.2f} USDT</strong></p>
@@ -120,55 +119,88 @@ def dashboard():
     """
     return render_template_string(html)
 
-# === SIMULATIONS-FUNKTIONEN ===
+# === BINANCE DATA ===
 def get_current_price():
-    global price_sim
-    # kleine zufällige Schwankung simulieren
-    price_sim *= 1 + random.uniform(-0.001, 0.001)
-    return round(price_sim, 2)
+    try:
+        url = f'https://api.binance.com/api/v3/ticker/price?symbol={symbol}'
+        data = requests.get(url).json()
+        return float(data['price'])
+    except Exception as e:
+        print(f"Fehler beim Abrufen des Preises: {e}")
+        return None
 
+def get_klines(interval='30m', limit=100):
+    """Holt Kerzendaten von Binance"""
+    url = f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}'
+    data = requests.get(url).json()
+    df = pd.DataFrame(data, columns=[
+        'open_time','open','high','low','close','volume','close_time','qav','num_trades','taker_base','taker_quote','ignore'])
+    df['timestamp'] = pd.to_datetime(df['close_time'], unit='ms')
+    df['open'] = df['open'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['close'] = df['close'].astype(float)
+    df.set_index('timestamp', inplace=True)
+    return df
+
+# === BOT LOGIK ===
 def run_bot_simulation():
     global open_trades, last_status_update
-    send_telegram_message("📢 Simulation gestartet ✅ (2h-Breakout Strategie)")
+    send_telegram_message("📢 Echtzeit-Simulation gestartet ✅ (2h/30m Breakout-Logik)")
 
     while True:
         try:
             now = datetime.now(timezone.utc)
-            current_price = get_current_price()
 
-            # 2h-Breakout Signale (simuliert)
-            lowest_2h = current_price * 0.98  # 2% Pullback simuliert
-            highest_2h = current_price * 1.02
+            # Hol 2h und 30m Kerzen
+            df_2h = get_klines(interval='2h', limit=50)
+            df_30m = get_klines(interval='30m', limit=200)
+
+            current_price = get_current_price()
+            if current_price is None:
+                time.sleep(5)
+                continue
+
+            # Breakout Signale basierend auf letzter 2h Kerze
+            last_2h = df_2h.iloc[-1]
+            lowest_2h = df_2h['low'].min()
+            highest_2h = df_2h['high'].max()
             change_up = (current_price - lowest_2h) / lowest_2h * 100
             change_down = (current_price - highest_2h) / highest_2h * 100
 
-            # LONG SIGNAL
+            signal = None
             if change_up >= trigger_pct:
-                qty = round(order_size_usdt / current_price, 3)
-                open_trades.append({'side':'long','entry_price':current_price,'entry_time':now,'amount':qty})
-                send_telegram_message(f"🟢 SIM LONG @ {current_price:.2f} | Menge: {qty}")
+                signal = 'long'
+            elif change_down <= -trigger_pct:
+                signal = 'short'
 
-            # SHORT SIGNAL
-            if change_down <= -trigger_pct:
-                qty = round(order_size_usdt / current_price, 3)
-                open_trades.append({'side':'short','entry_price':current_price,'entry_time':now,'amount':qty})
-                send_telegram_message(f"🔴 SIM SHORT @ {current_price:.2f} | Menge: {qty}")
+            if signal:
+                # Entry auf Basis 30m Kerzen (Pullback-Logik)
+                for idx, row in df_30m.iterrows():
+                    price_30m = row['close']
+                    if signal == 'long' and price_30m <= current_price:
+                        qty = round(order_size_usdt / price_30m, 3)
+                        open_trades.append({'side':'long','entry_price':price_30m*(1+fee_pct),
+                                            'entry_time':idx,'amount':qty})
+                        send_telegram_message(f"🟢 LONG ENTRY @ {price_30m:.2f} | Menge: {qty}")
+                        break
+                    elif signal == 'short' and price_30m >= current_price:
+                        qty = round(order_size_usdt / price_30m, 3)
+                        open_trades.append({'side':'short','entry_price':price_30m*(1-fee_pct),
+                                            'entry_time':idx,'amount':qty})
+                        send_telegram_message(f"🔴 SHORT ENTRY @ {price_30m:.2f} | Menge: {qty}")
+                        break
 
             # TP / SL prüfen
             updated_trades = []
-            current_price = get_current_price()
             for t in open_trades:
                 pnl_pct = ((current_price - t['entry_price']) / t['entry_price'] * 100
-                           if t['side']=='long'
-                           else (t['entry_price'] - current_price) / t['entry_price'] * 100)
+                           if t['side']=='long' else (t['entry_price'] - current_price) / t['entry_price'] * 100)
                 reason = None
-                if pnl_pct >= profit_target:
-                    reason = f"🎯 SIM TP erreicht (+{pnl_pct:.2f}%)"
-                elif pnl_pct <= -stop_loss:
-                    reason = f"🛑 SIM SL ausgelöst ({pnl_pct:.2f}%)"
-
+                if pnl_pct >= profit_target: reason='TP'
+                elif pnl_pct <= -stop_loss: reason='SL'
                 if reason:
-                    send_telegram_message(f"{reason}\nExit: {t['side'].upper()} @ {current_price:.2f}")
+                    send_telegram_message(f"🎯 {reason} ausgelöst: {t['side'].upper()} @ {current_price:.2f}")
                 else:
                     updated_trades.append(t)
 
@@ -176,17 +208,16 @@ def run_bot_simulation():
 
             # Status-Update alle 15 Minuten
             if (now - last_status_update).total_seconds() >= 900:
-                msg = f"📊 STATUS-UPDATE (Simulation)\nPreis: {current_price:.2f} USDT\nOpen Trades: {len(open_trades)}"
-                send_telegram_message(msg)
+                send_telegram_message(f"📊 STATUS: {current_price:.2f} USDT | Open Trades: {len(open_trades)}")
                 last_status_update = now
 
-            time.sleep(5)  # schneller für Simulation
+            time.sleep(5)
 
         except Exception as e:
             print(f"⚠️ Simulation Fehler: {e}")
             time.sleep(5)
 
-# === SIMULATION + FLASK PARALLEL STARTEN ===
+# === START BOT + FLASK ===
 if __name__ == "__main__":
-    threading.Thread(target=run_bot_simulation).start()
+    threading.Thread(target=run_bot_simulation, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
