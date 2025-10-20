@@ -1,6 +1,5 @@
+ccxt
+flask
 pandas
 numpy
-flask
 requests
-ccxt
-pip install ccxt flask pandas numpy
