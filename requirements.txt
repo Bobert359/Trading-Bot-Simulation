@@ -1,5 +1,12 @@
-ccxt
-flask
-pandas
-numpy
-requests
+# Binance / CCXT für Kursdaten
+ccxt>=2.0
+
+# Flask für Dashboard
+flask>=2.3
+
+# Datenverarbeitung
+pandas>=2.0
+numpy>=1.25
+
+# HTTP Requests (für Telegram-Bot)
+requests>=2.31
